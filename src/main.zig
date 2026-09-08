@@ -98,14 +98,13 @@ const App = struct {
         if (argsContain(args, "/SELFTEST") or argsContain(args, "SELFTEST")) return self.selfTest();
         if (args.len != 0) return self.runCommand(args);
         if (self.ctx.desk.programWindowId() >= 0) return self.runHosted();
-        self.printList();
-        return 0;
+        return self.printList();
     }
 
     fn runHosted(self: *App) i32 {
         _ = self.ctx.desk.guiSetTitle("Services");
         _ = self.ctx.desk.guiSetMinSize(700, 360);
-        self.reload();
+        self.reload(false);
         self.updateMetrics();
         self.render();
 
@@ -142,23 +141,29 @@ const App = struct {
         self.h = @max(canvas.h, 360);
     }
 
-    fn reload(self: *App) void {
-        self.count = 0;
-        var index: u32 = 0;
-        while (self.count < self.services.len) : (index += 1) {
-            var detail: r4os.abi.ServiceDetail = .{};
-            const rc = self.ctx.sys.serviceDetail(index, &detail);
-            if (rc <= 0) break;
-            self.services[self.count] = detail;
-            self.count += 1;
-        }
+    fn reload(self: *App, preserve_status: bool) void {
+        var staging: [16]r4os.abi.ServiceDetail = undefined;
+        const count = switch (r4os.app_services.readCompleteDetails(&self.ctx.sys, &staging)) {
+            .complete => |count| count,
+            .failure => |rc| {
+                if (preserve_status) {
+                    appendZ(&self.status, "; refresh failed: ");
+                } else {
+                    self.setStatus("Refresh failed: ");
+                }
+                appendZ(&self.status, resultName(rc));
+                return;
+            },
+        };
+        @memcpy(self.services[0..count], staging[0..count]);
+        self.count = count;
         if (self.count == 0) {
             self.selected = 0;
-            self.setStatus("No registered services.");
-        } else {
-            if (self.selected >= self.count) self.selected = self.count - 1;
-            self.setStatus("Ready.");
+        } else if (self.selected >= self.count) {
+            self.selected = self.count - 1;
         }
+        if (!preserve_status)
+            self.setStatus(if (self.count == 0) "No registered services." else "Ready.");
     }
 
     fn render(self: *App) void {
@@ -362,7 +367,7 @@ const App = struct {
                 self.render();
             },
             'r', 'R' => {
-                self.reload();
+                self.reload(false);
                 self.render();
             },
             else => {},
@@ -397,7 +402,7 @@ const App = struct {
 
     fn activate(self: *App, action: Action) void {
         if (action == .refresh) {
-            self.reload();
+            self.reload(false);
             return;
         }
         if (action == .install) {
@@ -423,7 +428,7 @@ const App = struct {
             else => r4os.abi.service_api_result_invalid,
         };
         self.setActionStatus(action, rc);
-        self.reload();
+        self.reload(true);
     }
 
     fn openInstallDialog(self: *App) void {
@@ -453,7 +458,7 @@ const App = struct {
         const rc = self.ctx.sys.serviceInstall(name_ptr, path_ptr, args_ptr, r4os.abi.service_start_manual, desc_ptr, &info);
         self.setActionStatus(.install, rc);
         if (rc == r4os.abi.service_api_result_ok) self.install_open = false;
-        self.reload();
+        self.reload(true);
     }
 
     fn selfTest(self: *App) i32 {
@@ -516,8 +521,7 @@ const App = struct {
     fn runCommand(self: *App, args: []const u8) i32 {
         const first = takeToken(args) orelse return 0;
         if (tokenEquals(first.token, "/LIST") or tokenEquals(first.token, "LIST")) {
-            self.printList();
-            return 0;
+            return self.printList();
         }
         if (tokenEquals(first.token, "/INSTALL") or tokenEquals(first.token, "INSTALL")) return self.commandInstall(first.rest);
         if (tokenEquals(first.token, "/REMOVE") or tokenEquals(first.token, "REMOVE")) return self.commandOne(first.rest, .remove);
@@ -585,15 +589,18 @@ const App = struct {
         return if (rc == r4os.abi.service_api_result_ok) 0 else 1;
     }
 
-    fn printList(self: *App) void {
+    fn printList(self: *App) i32 {
+        var staging: [16]r4os.abi.ServiceDetail = undefined;
+        const count = switch (r4os.app_services.readCompleteDetails(&self.ctx.sys, &staging)) {
+            .complete => |count| count,
+            .failure => |rc| {
+                self.ctx.sys.write("SERVICES: service enumeration failed: ");
+                self.ctx.sys.println(resultName(rc));
+                return 1;
+            },
+        };
         self.ctx.sys.println("SERVICES");
-        var index: u32 = 0;
-        var shown: u32 = 0;
-        while (true) : (index += 1) {
-            var detail: r4os.abi.ServiceDetail = .{};
-            const rc = self.ctx.sys.serviceDetail(index, &detail);
-            if (rc <= 0) break;
-            shown += 1;
+        for (staging[0..count]) |detail| {
             self.ctx.sys.write("  ");
             self.ctx.sys.write(spanZ(detail.info.name[0..]));
             self.ctx.sys.write(" state=");
@@ -604,7 +611,8 @@ const App = struct {
             self.ctx.sys.write(spanZ(detail.path[0..]));
             self.ctx.sys.println("");
         }
-        if (shown == 0) self.ctx.sys.println("  No registered services.");
+        if (count == 0) self.ctx.sys.println("  No registered services.");
+        return 0;
     }
 
     fn printUsage(self: *App) void {

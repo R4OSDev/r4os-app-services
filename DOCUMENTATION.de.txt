@@ -1,25 +1,33 @@
 ﻿SERVICES.R4X
 ============
 
-SERVICES.R4X ist die Desktop-nahe Service-Uebersicht.
+SERVICES.R4X ist die Desktop-nahe Service-Uebersicht. Die App zeigt Dienste
+und erlaubt Start, Stop, Neustart, Moduswechsel, Installation und Entfernen.
 
-Projektstruktur seit 0.51.18:
-- `build.zig` baut die App als eigenes SDK-Projekt.
-- `build.zig.zon` bindet `r4os_sdk` als Paket.
-- `module.R4MF` beschreibt Artefakt, Zielpfad und Contract.
+Besitzer und Build
+------------------
+Das kanonische Projekt liegt unter Repositories/Apps/Services. Aus diesem
+Verzeichnis wird unter Windows Build.bat, unter Linux ./Build.sh verwendet.
+Settings.R4S bindet SDK, Contract, DevKit und den Artefaktpfad relativ zum
+Projekt. module.R4MF ist die Quelle fuer Version, Ziel, Imports und App-Klasse.
+Der Workspace-Artefaktpfad ist Artifacts/Modules/Services/SERVICES.R4X.
 
-Build:
+Der SDK-Einstieg ist r4_app_main. Die App-Klasse ist gui; die eingebauten
+Plattformgruppen R4SYS, R4DESK und R4DRAW werden ueber Query:1 importiert.
+Ziel im Image: C:\R4OS\SOFTWARE\DESKTOP\SERVICES.R4X.
 
-    cd Code\System\Software\Services
-    ..\..\..\DevTools\Zig\zig.exe build
+Listen und Steuerung
+--------------------
+Die GUI uebernimmt Dienstdaten erst nach vollstaendiger Aufzaehlung. Fehler
+behalten die letzte gueltige Liste und Auswahl. Ein Refresh nach einer Aktion
+behaelt deren Ergebnistext; sein eigener Fehler wird gegebenenfalls ergaenzt.
 
-Ergebnis:
+In einer reinen Terminal-Sitzung ohne Desktop muss der vorhandene
+Terminal-Schalter /CONSOLE den textuellen Aufruf kennzeichnen:
 
-    Code\System\Software\Services\zig-out\SERVICES.R4X
+    C:\R4OS\SOFTWARE\DESKTOP\SERVICES.R4X /LIST /CONSOLE
 
-Contract:
-- R4XStart-Entry: `services_main`
-- App-Klasse: `gui`
-- R4L-Imports: `R4DESK:Query:1`, `R4DRAW:Query:1`
-- Zielpfad im Image: `C:\R4OS\SOFTWARE\DESKTOP\SERVICES.R4X`
-
+/SELFTEST verwendet bereits die automatische Konsolen-Startpolicy des
+Terminals. Unterstuetzte Steuerkommandos stehen in printUsage in src/main.zig.
+Deren Status stammt aus dem zentralen Servicebesitzer; SERVICES schreibt
+keine SERVICES.R4S. Die Konfiguration wird durch SERVMAN gespeichert.

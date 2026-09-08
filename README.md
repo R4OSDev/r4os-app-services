@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.4`
+- Version: see `module.R4MF`
 - Image target: `/R4OS/SOFTWARE/DESKTOP/SERVICES.R4X`
 - Image scope: `full`
 - Canonical project manifest: `module.R4MF`
@@ -18,7 +18,7 @@ On Windows:
 
     Build.bat
 
-On Linux or macOS:
+On Linux:
 
     ./Build.sh
 
@@ -29,7 +29,7 @@ mapped local checkouts.
 
 ## Documentation
 
-Detailed German technical notes from the migration are preserved in
+German build, lifecycle and console-mode notes are documented in
 `DOCUMENTATION.de.txt`. Source-transfer provenance is recorded in
 `PROVENANCE.txt`.
 
