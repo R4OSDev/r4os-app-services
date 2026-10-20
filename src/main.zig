@@ -122,7 +122,7 @@ const App = struct {
                         },
                         .mouse_down => self.handleMouseDown(event.x, event.y),
                         .mouse_up => self.handleMouseUp(event.x, event.y),
-                        .key_down => self.handleKey(@intCast(event.key & 0xFF)),
+                        .key_down => self.handleKey(event.key),
                         else => {},
                     }
                 },
@@ -346,8 +346,9 @@ const App = struct {
         }
     }
 
-    fn handleKey(self: *App, key: u8) void {
-        if (self.install_open) return self.handleInstallKey(key);
+    fn handleKey(self: *App, codepoint: u32) void {
+        const key: u8 = if (codepoint <= 0xff) @intCast(codepoint) else 0;
+        if (self.install_open) return self.handleInstallKey(codepoint);
         switch (key) {
             r4os.gui.Key.escape => self.should_exit = true,
             r4os.gui.Key.up => {
@@ -374,7 +375,8 @@ const App = struct {
         }
     }
 
-    fn handleInstallKey(self: *App, key: u8) void {
+    fn handleInstallKey(self: *App, codepoint: u32) void {
+        const key: u8 = if (codepoint <= 0xff) @intCast(codepoint) else 0;
         if (key == r4os.gui.Key.escape) {
             self.install_open = false;
             self.render();
@@ -391,10 +393,10 @@ const App = struct {
             return;
         }
         const changed = switch (self.install_focus) {
-            .name => self.install_name.handleClipboardKey(&self.ctx.desk, key),
-            .path => self.install_path.handleClipboardKey(&self.ctx.desk, key),
-            .args => self.install_args.handleClipboardKey(&self.ctx.desk, key),
-            .description => self.install_description.handleClipboardKey(&self.ctx.desk, key),
+            .name => self.install_name.handleClipboardCodepoint(&self.ctx.desk, codepoint),
+            .path => self.install_path.handleClipboardCodepoint(&self.ctx.desk, codepoint),
+            .args => self.install_args.handleClipboardCodepoint(&self.ctx.desk, codepoint),
+            .description => self.install_description.handleClipboardCodepoint(&self.ctx.desk, codepoint),
             else => false,
         };
         if (changed) self.render();
