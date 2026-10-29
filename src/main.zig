@@ -120,6 +120,12 @@ const App = struct {
                             self.updateMetrics();
                             self.render();
                         },
+                        .input_reset, .focus_lost => {
+                            const repaint = self.mouse_down_action != null or self.mouse_down_install != null;
+                            self.mouse_down_action = null;
+                            self.mouse_down_install = null;
+                            if (repaint) self.render();
+                        },
                         .mouse_down => self.handleMouseDown(event.x, event.y),
                         .mouse_up => self.handleMouseUp(event.x, event.y),
                         .key_down => self.handleKey(event.key),
