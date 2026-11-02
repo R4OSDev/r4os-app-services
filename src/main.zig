@@ -14,7 +14,7 @@ const AppApi = struct {
     }
 };
 
-const max_services = 16;
+const service_path_capacity = @sizeOf(@FieldType(r4os.abi.ServiceInventoryRow, "path"));
 const bg: u32 = 0xD8D0C8;
 const panel: u32 = 0xFFFFFF;
 const panel_shadow: u32 = 0x808080;
@@ -81,19 +81,28 @@ const App = struct {
     h: i32 = 420,
     should_exit: bool = false,
     selected: usize = 0,
+    selected_valid: bool = false,
+    first_visible: usize = 0,
+    fresh: bool = false,
     count: usize = 0,
-    services: [max_services]r4os.abi.ServiceDetail = .{r4os.abi.ServiceDetail{}} ** max_services,
+    inventory: ?r4os.app_services.Inventory = null,
+    services: []r4os.abi.ServiceInventoryRow = &.{},
+    pending_save: ?r4os.ProcessHandle = null,
     status: [128]u8 = .{0} ** 128,
     mouse_down_action: ?Action = null,
     mouse_down_install: ?InstallFocus = null,
     install_open: bool = false,
     install_focus: InstallFocus = .name,
     install_name: r4os.gui.TextField(24) = .{},
-    install_path: r4os.gui.TextField(96) = .{},
+    install_path: r4os.gui.TextField(service_path_capacity) = .{},
     install_args: r4os.gui.TextField(80) = .{},
     install_description: r4os.gui.TextField(72) = .{},
 
     fn run(self: *App) i32 {
+        defer if (self.inventory) |*inventory| inventory.deinit();
+        defer if (self.pending_save) |*child| {
+            _ = child.wait(r4os.time_contract.timeoutForever());
+        };
         const args = trim(zSlice(self.ctx.sys.argsRaw()));
         if (argsContain(args, "/SELFTEST") or argsContain(args, "SELFTEST")) return self.selfTest();
         if (args.len != 0) return self.runCommand(args);
@@ -110,14 +119,23 @@ const App = struct {
 
         var events = r4os.EventLoop.init(self.ctx.sys, self.ctx.desk, &.{});
         while (!self.ctx.sys.programShouldClose() and !self.should_exit) {
-            switch (events.wait(r4os.time_contract.timeoutForever())) {
+            const timeout = if (self.pending_save != null)
+                r4os.time_contract.timeoutFinite(.{ .nanoseconds = 250_000_000 })
+            else
+                r4os.time_contract.timeoutForever();
+            switch (events.wait(timeout)) {
                 .message => |message| {
                     const event = message.guiEvent() orelse continue;
                     const kind: r4os.abi.GuiEventKind = @enumFromInt(event.kind);
                     switch (kind) {
-                        .close => return 0,
+                        .close => {
+                            if (self.pending_save == null) return 0;
+                            _ = self.finishSave(false);
+                            self.render();
+                        },
                         .resize => {
                             self.updateMetrics();
+                            self.ensureVisible();
                             self.render();
                         },
                         .input_reset, .focus_lost => {
@@ -128,12 +146,22 @@ const App = struct {
                         },
                         .mouse_down => self.handleMouseDown(event.x, event.y),
                         .mouse_up => self.handleMouseUp(event.x, event.y),
+                        .mouse_wheel => {
+                            if (!self.install_open) {
+                                const delta: i32 = @bitCast(event.key);
+                                self.scrollRows(if (delta > 0) -3 else if (delta < 0) 3 else 0);
+                                self.render();
+                            }
+                        },
                         .key_down => self.handleKey(event.key),
                         else => {},
                     }
                 },
                 .failure => |raw| return raw,
-                .timed_out => {},
+                .timed_out => {
+                    _ = self.finishSave(false);
+                    self.render();
+                },
             }
         }
         return 0;
@@ -148,28 +176,46 @@ const App = struct {
     }
 
     fn reload(self: *App, preserve_status: bool) void {
-        var staging: [16]r4os.abi.ServiceDetail = undefined;
-        const count = switch (r4os.app_services.readCompleteDetails(&self.ctx.sys, &staging)) {
-            .complete => |count| count,
+        const inventory = switch (r4os.app_services.readInventory(&self.ctx.sys, self.ctx.sys.allocator())) {
+            .complete => |value| value,
             .failure => |rc| {
+                self.fresh = false;
                 if (preserve_status) {
                     appendZ(&self.status, "; refresh failed: ");
                 } else {
-                    self.setStatus("Refresh failed: ");
+                    self.setStatus("Stale data; refresh failed: ");
                 }
                 appendZ(&self.status, resultName(rc));
                 return;
             },
         };
-        @memcpy(self.services[0..count], staging[0..count]);
-        self.count = count;
-        if (self.count == 0) {
-            self.selected = 0;
-        } else if (self.selected >= self.count) {
-            self.selected = self.count - 1;
-        }
+        self.adoptInventory(inventory);
         if (!preserve_status)
             self.setStatus(if (self.count == 0) "No registered services." else "Ready.");
+    }
+
+    fn adoptInventory(self: *App, inventory: r4os.app_services.Inventory) void {
+        const original = if (self.selected_valid and self.selected < self.count) self.services[self.selected].registration_id else 0;
+        const had_inventory = self.inventory != null;
+        if (self.inventory) |*old| old.deinit();
+        self.inventory = inventory;
+        self.services = inventory.rows;
+        self.count = self.services.len;
+        self.fresh = true;
+        self.selected_valid = false;
+        if (original != 0) {
+            for (self.services, 0..) |row, index| {
+                if (row.registration_id == original) {
+                    self.selected = index;
+                    self.selected_valid = true;
+                    break;
+                }
+            }
+        } else if (!had_inventory and self.count != 0) {
+            self.selected = 0;
+            self.selected_valid = true;
+        }
+        self.ensureVisible();
     }
 
     fn render(self: *App) void {
@@ -224,32 +270,34 @@ const App = struct {
         _ = canvas.text(header.x + 500, header.y + 5, "Path", header_text, header_bg);
 
         var row: usize = 0;
-        while (row < self.visibleRows() and row < self.count) : (row += 1) {
-            self.drawServiceRow(canvas, scratch, row);
+        while (row < self.visibleRows() and row < self.count -| self.first_visible) : (row += 1) {
+            self.drawServiceRow(canvas, scratch, self.first_visible + row);
         }
+        self.drawScroll(canvas);
     }
 
     fn drawServiceRow(self: *App, canvas: r4os.gui.Canvas, scratch: []u8, row: usize) void {
         const detail = &self.services[row];
         const rect = self.rowRect(row);
-        const selected_row = row == self.selected;
+        const selected_row = self.selected_valid and row == self.selected;
         const bg_color = if (selected_row) selected_bg else panel;
         const fg_color = if (selected_row) selected_text else text;
+        var number: [32]u8 = .{0} ** 32;
         _ = canvas.rect(rect, bg_color);
         _ = canvas.textClipped(rect.x + 6, rect.y + 4, 136, scratch, spanZ(detail.info.name[0..]), fg_color, bg_color);
         _ = canvas.textClipped(rect.x + 150, rect.y + 4, 86, scratch, serviceStateName(detail.info.state), serviceStateColor(detail.info.state, fg_color), bg_color);
         _ = canvas.textClipped(rect.x + 244, rect.y + 4, 78, scratch, serviceStartName(detail.info.start_mode), fg_color, bg_color);
-        numberText(scratch, @intCast(detail.info.instance_id));
-        _ = canvas.textClipped(rect.x + 330, rect.y + 4, 72, scratch, spanZ(scratch), fg_color, bg_color);
-        numberText(scratch, @intCast(detail.info.restart_count));
-        _ = canvas.textClipped(rect.x + 410, rect.y + 4, 82, scratch, spanZ(scratch), fg_color, bg_color);
+        numberText(&number, @intCast(detail.info.instance_id));
+        _ = canvas.textClipped(rect.x + 330, rect.y + 4, 72, scratch, spanZ(&number), fg_color, bg_color);
+        numberText(&number, @intCast(detail.info.restart_count));
+        _ = canvas.textClipped(rect.x + 410, rect.y + 4, 82, scratch, spanZ(&number), fg_color, bg_color);
         _ = canvas.textClipped(rect.x + 500, rect.y + 4, rect.w - 506, scratch, spanZ(detail.path[0..]), fg_color, bg_color);
     }
 
     fn drawDetails(self: *App, canvas: r4os.gui.Canvas, scratch: []u8) void {
         const rect = self.detailsRect();
         _ = canvas.groupBox(.{ .rect = rect, .title = "Details" }, scratch);
-        if (self.count == 0) return;
+        if (!self.selected_valid or self.selected >= self.count) return;
         const detail = &self.services[self.selected];
         var line: [160]u8 = .{0} ** 160;
         setZ(line[0..], "Name: ");
@@ -325,6 +373,10 @@ const App = struct {
             self.render();
             return;
         }
+        if (self.scrollAt(x, y)) {
+            self.render();
+            return;
+        }
         if (self.selectRowAt(x, y)) return;
         if (self.actionAt(x, y)) |action| {
             if (!self.actionDisabled(action)) {
@@ -355,22 +407,42 @@ const App = struct {
     fn handleKey(self: *App, codepoint: u32) void {
         const key: u8 = if (codepoint <= 0xff) @intCast(codepoint) else 0;
         if (self.install_open) return self.handleInstallKey(codepoint);
+        if (self.count != 0 and (key == r4os.gui.Key.up or key == r4os.gui.Key.down or key == r4os.gui.Key.home or key == r4os.gui.Key.end or key == r4os.gui.Key.page_up or key == r4os.gui.Key.page_down)) {
+            if (!self.selected_valid) self.selected = 0;
+            self.selected_valid = true;
+        }
         switch (key) {
-            r4os.gui.Key.escape => self.should_exit = true,
+            r4os.gui.Key.escape => {
+                if (self.pending_save == null) self.should_exit = true;
+            },
             r4os.gui.Key.up => {
                 if (self.selected > 0) self.selected -= 1;
+                self.ensureVisible();
                 self.render();
             },
             r4os.gui.Key.down => {
                 if (self.selected + 1 < self.count) self.selected += 1;
+                self.ensureVisible();
                 self.render();
             },
             r4os.gui.Key.home => {
                 self.selected = 0;
+                self.ensureVisible();
                 self.render();
             },
             r4os.gui.Key.end => {
                 if (self.count > 0) self.selected = self.count - 1;
+                self.ensureVisible();
+                self.render();
+            },
+            r4os.gui.Key.page_up => {
+                self.selected -|= @max(self.visibleRows(), 1);
+                self.ensureVisible();
+                self.render();
+            },
+            r4os.gui.Key.page_down => {
+                if (self.count != 0) self.selected = @min(self.count - 1, self.selected +| @max(self.visibleRows(), 1));
+                self.ensureVisible();
                 self.render();
             },
             'r', 'R' => {
@@ -410,6 +482,7 @@ const App = struct {
 
     fn activate(self: *App, action: Action) void {
         if (action == .refresh) {
+            _ = self.finishSave(false);
             self.reload(false);
             return;
         }
@@ -417,25 +490,10 @@ const App = struct {
             self.openInstallDialog();
             return;
         }
-        if (self.count == 0) return;
-        const name = spanZ(self.services[self.selected].info.name[0..]);
-        var name_z: [r4os.abi.service_name_bytes + 1]u8 = .{0} ** (r4os.abi.service_name_bytes + 1);
-        const name_ptr = makeZ(name_z[0..], name) orelse {
-            self.setStatus("Service name invalid.");
-            return;
-        };
-        var info: r4os.abi.ServiceInfo = .{};
-        const rc = switch (action) {
-            .start => self.ctx.sys.serviceStart(name_ptr, &info),
-            .stop => self.ctx.sys.serviceStop(name_ptr, &info, 40),
-            .restart => self.ctx.sys.serviceRestart(name_ptr, &info),
-            .enable => self.ctx.sys.serviceSetStartMode(name_ptr, r4os.abi.service_start_manual, &info),
-            .auto => self.ctx.sys.serviceSetStartMode(name_ptr, r4os.abi.service_start_auto, &info),
-            .disable => self.ctx.sys.serviceSetStartMode(name_ptr, r4os.abi.service_start_disabled, &info),
-            .remove => self.ctx.sys.serviceRemove(name_ptr),
-            else => r4os.abi.service_api_result_invalid,
-        };
+        if (self.actionDisabled(action)) return;
+        const rc = self.controlRow(&self.services[self.selected], action);
         self.setActionStatus(action, rc);
+        if (rc == 0 and (action == .enable or action == .auto or action == .disable or action == .remove)) _ = self.persist();
         self.reload(true);
     }
 
@@ -455,7 +513,7 @@ const App = struct {
             return;
         }
         var name_z: [r4os.abi.service_name_bytes + 1]u8 = .{0} ** (r4os.abi.service_name_bytes + 1);
-        var path_z: [r4os.abi.service_path_bytes + 1]u8 = .{0} ** (r4os.abi.service_path_bytes + 1);
+        var path_z: [service_path_capacity]u8 = .{0} ** service_path_capacity;
         var args_z: [r4os.abi.service_args_bytes + 1]u8 = .{0} ** (r4os.abi.service_args_bytes + 1);
         var desc_z: [r4os.abi.service_description_bytes + 1]u8 = .{0} ** (r4os.abi.service_description_bytes + 1);
         const name_ptr = makeZ(name_z[0..], trim(self.install_name.value())) orelse return self.setStatus("Name too long.");
@@ -465,13 +523,42 @@ const App = struct {
         var info: r4os.abi.ServiceInfo = .{};
         const rc = self.ctx.sys.serviceInstall(name_ptr, path_ptr, args_ptr, r4os.abi.service_start_manual, desc_ptr, &info);
         self.setActionStatus(.install, rc);
-        if (rc == r4os.abi.service_api_result_ok) self.install_open = false;
+        if (rc == r4os.abi.service_api_result_ok) {
+            self.install_open = false;
+            _ = self.persist();
+        }
         self.reload(true);
     }
 
     fn selfTest(self: *App) i32 {
         self.ctx.sys.println("SERVICES selftest");
         if (!self.ctx.sys.hasFn("service_start")) return self.fail("api-version");
+        const allocator = self.ctx.sys.allocator();
+        const large = allocator.alloc(r4os.abi.ServiceInventoryRow, 300) catch return self.fail("large-memory");
+        for (large, 1..) |*row, id| row.* = .{ .registration_id = id };
+        self.adoptInventory(.{ .rows = large, .revision = 1, .allocator = allocator });
+        self.selected = 299;
+        self.selected_valid = true;
+        self.ensureVisible();
+        if (self.first_visible == 0 or self.rowRect(299).y < self.firstRowY()) return self.fail("large-scroll");
+        self.h = 360;
+        self.ensureVisible();
+        if (self.selected - self.first_visible >= self.visibleRows()) return self.fail("resize-selection");
+        const swapped = allocator.alloc(r4os.abi.ServiceInventoryRow, 300) catch return self.fail("swap-memory");
+        for (swapped, 1..) |*row, id| row.* = .{ .registration_id = id };
+        swapped[0].registration_id = 300;
+        swapped[299].registration_id = 1;
+        self.adoptInventory(.{ .rows = swapped, .revision = 2, .allocator = allocator });
+        if (!self.selected_valid or self.selected != 0) return self.fail("identity-selection");
+        const replacement = allocator.alloc(r4os.abi.ServiceInventoryRow, 1) catch return self.fail("replacement-memory");
+        replacement[0] = .{ .registration_id = 999 };
+        self.adoptInventory(.{ .rows = replacement, .revision = 3, .allocator = allocator });
+        if (self.selected_valid or !self.actionDisabled(.start)) return self.fail("replacement-selected");
+        self.fresh = false;
+        if (!self.actionDisabled(.install) or !self.actionDisabled(.remove) or self.actionDisabled(.refresh)) return self.fail("stale-actions");
+        self.ctx.sys.println("SERVICES list model: 300 rows, scroll, resize, identity selection, stale actions: OK");
+        self.reload(false);
+        if (!self.fresh) return self.fail("inventory");
         self.cleanupTempService();
 
         var detail: r4os.abi.ServiceDetail = .{};
@@ -548,21 +635,22 @@ const App = struct {
             self.printUsage();
             return 1;
         };
-        var name_z: [r4os.abi.service_name_bytes + 1]u8 = .{0} ** (r4os.abi.service_name_bytes + 1);
-        const name_ptr = makeZ(name_z[0..], part.token) orelse return 1;
-        var info: r4os.abi.ServiceInfo = .{};
-        const rc = switch (action) {
-            .start => self.ctx.sys.serviceStart(name_ptr, &info),
-            .stop => self.ctx.sys.serviceStop(name_ptr, &info, 40),
-            .restart => self.ctx.sys.serviceRestart(name_ptr, &info),
-            .enable => self.ctx.sys.serviceSetStartMode(name_ptr, r4os.abi.service_start_manual, &info),
-            .auto => self.ctx.sys.serviceSetStartMode(name_ptr, r4os.abi.service_start_auto, &info),
-            .disable => self.ctx.sys.serviceSetStartMode(name_ptr, r4os.abi.service_start_disabled, &info),
-            .remove => self.ctx.sys.serviceRemove(name_ptr),
-            else => r4os.abi.service_api_result_invalid,
+        self.reload(false);
+        if (!self.fresh) return 1;
+        var selected: ?*const r4os.abi.ServiceInventoryRow = null;
+        for (self.services) |*row| if (sameBytes(spanZ(&row.info.name), part.token)) {
+            selected = row;
+            break;
         };
+        const row = selected orelse {
+            self.printCommandResult(action, part.token, r4os.abi.service_api_result_not_found);
+            return 1;
+        };
+        const rc = self.controlRow(row, action);
         self.printCommandResult(action, part.token, rc);
-        return if (rc == r4os.abi.service_api_result_ok) 0 else 1;
+        if (rc != 0) return 1;
+        if (action == .enable or action == .auto or action == .disable or action == .remove) return if (self.persist()) 0 else 1;
+        return 0;
     }
 
     fn commandInstall(self: *App, rest_raw: []const u8) i32 {
@@ -584,7 +672,7 @@ const App = struct {
         }
 
         var name_z: [r4os.abi.service_name_bytes + 1]u8 = .{0} ** (r4os.abi.service_name_bytes + 1);
-        var path_z: [r4os.abi.service_path_bytes + 1]u8 = .{0} ** (r4os.abi.service_path_bytes + 1);
+        var path_z: [service_path_capacity]u8 = .{0} ** service_path_capacity;
         var args_z: [r4os.abi.service_args_bytes + 1]u8 = .{0} ** (r4os.abi.service_args_bytes + 1);
         var desc_z: [r4os.abi.service_description_bytes + 1]u8 = .{0} ** (r4os.abi.service_description_bytes + 1);
         const name_ptr = makeZ(name_z[0..], name_part.token) orelse return 1;
@@ -594,21 +682,17 @@ const App = struct {
         var info: r4os.abi.ServiceInfo = .{};
         const rc = self.ctx.sys.serviceInstall(name_ptr, path_ptr, args_ptr, mode, desc_ptr, &info);
         self.printCommandResult(.install, name_part.token, rc);
-        return if (rc == r4os.abi.service_api_result_ok) 0 else 1;
+        return if (rc == r4os.abi.service_api_result_ok and self.persist()) 0 else 1;
     }
 
     fn printList(self: *App) i32 {
-        var staging: [16]r4os.abi.ServiceDetail = undefined;
-        const count = switch (r4os.app_services.readCompleteDetails(&self.ctx.sys, &staging)) {
-            .complete => |count| count,
-            .failure => |rc| {
-                self.ctx.sys.write("SERVICES: service enumeration failed: ");
-                self.ctx.sys.println(resultName(rc));
-                return 1;
-            },
-        };
+        self.reload(false);
+        if (!self.fresh) {
+            self.ctx.sys.println(spanZ(&self.status));
+            return 1;
+        }
         self.ctx.sys.println("SERVICES");
-        for (staging[0..count]) |detail| {
+        for (self.services) |detail| {
             self.ctx.sys.write("  ");
             self.ctx.sys.write(spanZ(detail.info.name[0..]));
             self.ctx.sys.write(" state=");
@@ -619,7 +703,7 @@ const App = struct {
             self.ctx.sys.write(spanZ(detail.path[0..]));
             self.ctx.sys.println("");
         }
-        if (count == 0) self.ctx.sys.println("  No registered services.");
+        if (self.count == 0) self.ctx.sys.println("  No registered services.");
         return 0;
     }
 
@@ -639,8 +723,10 @@ const App = struct {
     }
 
     fn actionDisabled(self: *const App, action: Action) bool {
-        if (action == .install or action == .refresh) return false;
-        return self.count == 0;
+        if (action == .refresh) return false;
+        if (!self.fresh or self.pending_save != null) return true;
+        if (action == .install) return false;
+        return !self.selected_valid or self.selected >= self.count;
     }
 
     fn actionAt(self: *const App, x: i32, y: i32) ?Action {
@@ -654,8 +740,9 @@ const App = struct {
         if (!self.listRect().contains(x, y)) return false;
         if (y < self.firstRowY()) return false;
         const raw: usize = @intCast(@divTrunc(y - self.firstRowY(), row_h));
-        if (raw >= self.count or raw >= self.visibleRows()) return false;
-        self.selected = raw;
+        if (raw >= self.visibleRows() or raw >= self.count -| self.first_visible) return false;
+        self.selected = self.first_visible + raw;
+        self.selected_valid = true;
         self.render();
         return true;
     }
@@ -722,7 +809,99 @@ const App = struct {
 
     fn rowRect(self: *const App, row: usize) r4os.gui.Rect {
         const rect = self.listRect();
-        return .{ .x = rect.x + 1, .y = self.firstRowY() + @as(i32, @intCast(row)) * row_h, .w = rect.w - 2, .h = row_h };
+        return .{ .x = rect.x + 1, .y = self.firstRowY() + @as(i32, @intCast(row - self.first_visible)) * row_h, .w = rect.w - 20, .h = row_h };
+    }
+
+    fn ensureVisible(self: *App) void {
+        const visible = @max(self.visibleRows(), 1);
+        if (self.selected_valid and self.selected < self.count) {
+            if (self.selected < self.first_visible) self.first_visible = self.selected;
+            if (self.selected - self.first_visible >= visible) self.first_visible = self.selected - visible + 1;
+        }
+        self.first_visible = @min(self.first_visible, self.count -| visible);
+    }
+
+    fn scrollRows(self: *App, delta: i32) void {
+        if (delta < 0) self.first_visible -|= @as(usize, @intCast(-@as(i64, delta))) else self.first_visible = @min(self.count -| self.visibleRows(), self.first_visible +| @as(usize, @intCast(delta)));
+    }
+
+    fn scrollRect(self: *const App) r4os.gui.Rect {
+        const rect = self.listRect();
+        return .{ .x = rect.x + rect.w - 18, .y = self.firstRowY(), .w = 16, .h = @intCast(self.visibleRows() * row_h) };
+    }
+
+    fn drawScroll(self: *App, canvas: r4os.gui.Canvas) void {
+        const rect = self.scrollRect();
+        if (rect.h < 1) return;
+        _ = canvas.rect(rect, 0xB0B0B0);
+        const track: usize = @intCast(rect.h);
+        const thumb: usize = if (self.count == 0) track else @min(track, @max(16, @as(usize, @intCast(@as(u128, track) * self.visibleRows() / self.count))));
+        const maximum = self.count -| self.visibleRows();
+        const y: usize = if (maximum == 0) 0 else @intCast(@as(u128, track - thumb) * self.first_visible / maximum);
+        _ = canvas.rect(.{ .x = rect.x + 1, .y = rect.y + @as(i32, @intCast(y)), .w = rect.w - 2, .h = @intCast(thumb) }, bg);
+    }
+
+    fn scrollAt(self: *App, x: i32, y: i32) bool {
+        const rect = self.scrollRect();
+        if (!rect.contains(x, y) or rect.h <= 1) return false;
+        const maximum = self.count -| self.visibleRows();
+        self.first_visible = @intCast(@as(u128, @intCast(y - rect.y)) * maximum / @as(u32, @intCast(rect.h - 1)));
+        return true;
+    }
+
+    fn controlRow(self: *App, row: *const r4os.abi.ServiceInventoryRow, action: Action) i32 {
+        var request: r4os.abi.ServiceControlRequest = .{ .registration_id = row.registration_id, .start_generation = row.start_generation, .process = row.process };
+        switch (action) {
+            .start => request.operation = r4os.abi.service_control_start,
+            .stop => {
+                request.operation = r4os.abi.service_control_stop;
+                request.timeout_ticks = 40;
+            },
+            .restart => request.operation = r4os.abi.service_control_restart,
+            .enable, .auto, .disable => {
+                request.operation = r4os.abi.service_control_mode;
+                request.mode = switch (action) {
+                    .enable => r4os.abi.service_start_manual,
+                    .auto => r4os.abi.service_start_auto,
+                    else => r4os.abi.service_start_disabled,
+                };
+            },
+            .remove => request.operation = r4os.abi.service_control_remove,
+            else => return r4os.abi.service_api_result_invalid,
+        }
+        return self.ctx.sys.serviceControlBound(&request);
+    }
+
+    fn persist(self: *App) bool {
+        if (self.pending_save != null) {
+            self.setStatus("Configuration save still pending.");
+            return false;
+        }
+        const resources: r4os.app_resources.Resources = .{ .sys = self.ctx.sys };
+        const path = "C:\\R4OS\\SOFTWARE\\TERMINAL\\SERVMAN.R4X";
+        self.pending_save = switch (resources.spawnWithConsoleHost(.{ .ptr = path, .len = path.len }, "SAVE", .console, .terminal_mode)) {
+            .process => |child| child,
+            .failure => {
+                self.setStatus("Change active; SERVMAN save could not start.");
+                return false;
+            },
+        };
+        return self.finishSave(true);
+    }
+
+    fn finishSave(self: *App, wait: bool) bool {
+        if (self.pending_save) |*child| {
+            switch (child.wait(if (wait) r4os.time_contract.timeoutForever() else r4os.time_contract.timeoutPoll())) {
+                .exited => |code| {
+                    self.pending_save = null;
+                    self.setStatus(if (code == 0) "Change active; configuration saved." else "Change active; configuration save failed.");
+                    return code == 0;
+                },
+                else => self.setStatus("Change active; configuration save not yet confirmed."),
+            }
+            return false;
+        }
+        return true;
     }
 
     fn visibleRows(self: *const App) usize {
@@ -829,6 +1008,10 @@ fn serviceStateColor(raw: u32, fallback: u32) u32 {
 fn resultName(rc: i32) []const u8 {
     return switch (rc) {
         r4os.abi.service_api_result_ok => "OK",
+        r4os.abi.service_api_result_memory => "out-of-memory",
+        r4os.abi.service_api_result_exhausted => "identity-exhausted",
+        r4os.abi.service_api_result_restart => "inventory-changed",
+        r4os.abi.service_api_result_busy => "stale-or-busy",
         r4os.abi.service_api_result_not_found => "not-found",
         r4os.abi.service_api_result_not_running => "not-running",
         r4os.abi.service_api_result_no_endpoint => "no-endpoint",
