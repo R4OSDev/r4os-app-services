@@ -5,7 +5,7 @@ const AppApi = struct {
     desk: r4os.r4desk.Context,
     draw: r4os.r4draw.Context,
 
-    fn init(r4_app: *r4os.App) ?AppApi {
+    fn init(r4_app: *r4os.App2) ?AppApi {
         return .{
             .sys = r4_app.system(),
             .desk = r4_app.desktop() orelse return null,
@@ -69,10 +69,10 @@ const InstallFocus = enum(u8) {
     cancel,
 };
 
-pub fn r4_app_main(r4_app: *r4os.App) i32 {
+pub fn r4_app_main(r4_app: *r4os.App2) i32 {
     var ctx = AppApi.init(r4_app) orelse return r4os.abi.err_no_group;
     var app = App{ .ctx = &ctx };
-    return app.run();
+    return app.run(r4_app.args());
 }
 
 const App = struct {
@@ -98,12 +98,12 @@ const App = struct {
     install_args: r4os.gui.TextField(80) = .{},
     install_description: r4os.gui.TextField(72) = .{},
 
-    fn run(self: *App) i32 {
+    fn run(self: *App, raw: []const u8) i32 {
         defer if (self.inventory) |*inventory| inventory.deinit();
         defer if (self.pending_save) |*child| {
             _ = child.wait(r4os.time_contract.timeoutForever());
         };
-        const args = trim(zSlice(self.ctx.sys.argsRaw()));
+        const args = trim(raw);
         if (argsContain(args, "/SELFTEST") or argsContain(args, "SELFTEST")) return self.selfTest();
         if (args.len != 0) return self.runCommand(args);
         if (self.ctx.desk.programWindowId() >= 0) return self.runHosted();
@@ -119,11 +119,7 @@ const App = struct {
 
         var events = r4os.EventLoop.init(self.ctx.sys, self.ctx.desk, &.{});
         while (!self.ctx.sys.programShouldClose() and !self.should_exit) {
-            const timeout = if (self.pending_save != null)
-                r4os.time_contract.timeoutFinite(.{ .nanoseconds = 250_000_000 })
-            else
-                r4os.time_contract.timeoutForever();
-            switch (events.wait(timeout)) {
+            switch (self.waitHosted(&events)) {
                 .message => |message| {
                     const event = message.guiEvent() orelse continue;
                     const kind: r4os.abi.GuiEventKind = @enumFromInt(event.kind);
@@ -165,6 +161,44 @@ const App = struct {
             }
         }
         return 0;
+    }
+
+    fn waitHosted(self: *App, events: *r4os.EventLoop) r4os.app_gui.WaitResult {
+        const child = if (self.pending_save) |*value| value else return events.wait(r4os.time_contract.timeoutForever());
+        const interval = r4os.time_contract.timeoutFinite(.{ .nanoseconds = 250_000_000 });
+        const context = self.ctx.sys.base.generation2 orelse return events.wait(interval);
+        var observed = events.activity_sequence;
+        if (self.ctx.desk.guiActivityWait(observed, 0, events.subscriptions, &observed) < 0) return events.wait(interval);
+        events.activity_sequence = observed;
+        if (events.poll()) |message| return .{ .message = message };
+        if (!waitSaveOrGui(context, child, observed)) return events.wait(interval);
+        return events.wait(r4os.time_contract.timeoutPoll());
+    }
+
+    fn waitSaveOrGui(context: *const r4os.platform2.Context, child: *const r4os.ProcessHandle, observed: u64) bool {
+        const ws = r4os.wait_set;
+        const a = r4os.abi;
+        if (!child.valid()) return false;
+        const handle: a.ProgramProcessHandle = .{ .instance_id = child.raw, .generation = child.generation };
+        var process_source: ws.Source = .{};
+        if (ws.prepare(context, ws.process(handle, 1), &process_source) != 0) return false;
+        var gui_source: ws.Source = .{};
+        if (ws.prepare(context, ws.guiActivity(observed, 2), &gui_source) != 0) return false;
+        var set: ws.Set = undefined;
+        if (ws.Set.init(context, 2, &set) != 0) return false;
+        defer _ = set.close();
+        var process_registration: u64 = 0;
+        var gui_registration: u64 = 0;
+        if (set.enroll(process_source, &process_registration) != 0 or set.enroll(gui_source, &gui_registration) != 0) return false;
+        var ready: [2]ws.Event = undefined;
+        var batch: ws.Batch = .{};
+        if (set.wait(.{ .kind = a.timeout_kind_forever }, &ready, &batch) != 0 or
+            batch.outcome != a.waitset_outcome_ready or batch.count > ready.len) return false;
+        for (ready[0..batch.count]) |event| {
+            if (event.flags == a.waitset_event_ready and
+                (event.registration == process_registration or event.registration == gui_registration)) return true;
+        }
+        return false;
     }
 
     fn updateMetrics(self: *App) void {
@@ -493,7 +527,7 @@ const App = struct {
         if (self.actionDisabled(action)) return;
         const rc = self.controlRow(&self.services[self.selected], action);
         self.setActionStatus(action, rc);
-        if (rc == 0 and (action == .enable or action == .auto or action == .disable or action == .remove)) _ = self.persist();
+        if (rc == 0 and (action == .enable or action == .auto or action == .disable or action == .remove)) _ = self.persist(false);
         self.reload(true);
     }
 
@@ -525,7 +559,7 @@ const App = struct {
         self.setActionStatus(.install, rc);
         if (rc == r4os.abi.service_api_result_ok) {
             self.install_open = false;
-            _ = self.persist();
+            _ = self.persist(false);
         }
         self.reload(true);
     }
@@ -614,7 +648,10 @@ const App = struct {
     }
 
     fn runCommand(self: *App, args: []const u8) i32 {
-        const first = takeToken(args) orelse return 0;
+        const first = takeToken(args) orelse {
+            self.printUsage();
+            return 1;
+        };
         if (tokenEquals(first.token, "/LIST") or tokenEquals(first.token, "LIST")) {
             return self.printList();
         }
@@ -649,7 +686,7 @@ const App = struct {
         const rc = self.controlRow(row, action);
         self.printCommandResult(action, part.token, rc);
         if (rc != 0) return 1;
-        if (action == .enable or action == .auto or action == .disable or action == .remove) return if (self.persist()) 0 else 1;
+        if (action == .enable or action == .auto or action == .disable or action == .remove) return if (self.persist(true)) 0 else 1;
         return 0;
     }
 
@@ -682,7 +719,7 @@ const App = struct {
         var info: r4os.abi.ServiceInfo = .{};
         const rc = self.ctx.sys.serviceInstall(name_ptr, path_ptr, args_ptr, mode, desc_ptr, &info);
         self.printCommandResult(.install, name_part.token, rc);
-        return if (rc == r4os.abi.service_api_result_ok and self.persist()) 0 else 1;
+        return if (rc == r4os.abi.service_api_result_ok and self.persist(true)) 0 else 1;
     }
 
     fn printList(self: *App) i32 {
@@ -850,29 +887,23 @@ const App = struct {
     }
 
     fn controlRow(self: *App, row: *const r4os.abi.ServiceInventoryRow, action: Action) i32 {
-        var request: r4os.abi.ServiceControlRequest = .{ .registration_id = row.registration_id, .start_generation = row.start_generation, .process = row.process };
-        switch (action) {
-            .start => request.operation = r4os.abi.service_control_start,
-            .stop => {
-                request.operation = r4os.abi.service_control_stop;
-                request.timeout_ticks = 40;
-            },
-            .restart => request.operation = r4os.abi.service_control_restart,
-            .enable, .auto, .disable => {
-                request.operation = r4os.abi.service_control_mode;
-                request.mode = switch (action) {
-                    .enable => r4os.abi.service_start_manual,
-                    .auto => r4os.abi.service_start_auto,
-                    else => r4os.abi.service_start_disabled,
-                };
-            },
-            .remove => request.operation = r4os.abi.service_control_remove,
+        const sys = &self.ctx.sys;
+        const command: r4os.app_services.InventoryAction = switch (action) {
+            .start => .start,
+            .stop => .{ .stop = r4os.time_contract.timeoutFinite(
+                r4os.time_contract.durationFromTicks(40, sys.monotonicHz()) catch return r4os.abi.service_api_result_invalid,
+            ) },
+            .restart => .restart,
+            .enable => .{ .mode = r4os.abi.service_start_manual },
+            .auto => .{ .mode = r4os.abi.service_start_auto },
+            .disable => .{ .mode = r4os.abi.service_start_disabled },
+            .remove => .remove,
             else => return r4os.abi.service_api_result_invalid,
-        }
-        return self.ctx.sys.serviceControlBound(&request);
+        };
+        return r4os.app_services.controlEntry(sys, row, command);
     }
 
-    fn persist(self: *App) bool {
+    fn persist(self: *App, wait: bool) bool {
         if (self.pending_save != null) {
             self.setStatus("Configuration save still pending.");
             return false;
@@ -886,7 +917,9 @@ const App = struct {
                 return false;
             },
         };
-        return self.finishSave(true);
+        if (wait) return self.finishSave(true);
+        self.setStatus("Change active; saving configuration.");
+        return true;
     }
 
     fn finishSave(self: *App, wait: bool) bool {
@@ -985,7 +1018,8 @@ fn serviceStateName(raw: u32) []const u8 {
         r4os.abi.service_state_stopping => "stopping",
         r4os.abi.service_state_failed => "failed",
         r4os.abi.service_state_disabled => "disabled",
-        else => "empty",
+        r4os.abi.service_state_empty => "empty",
+        else => "unknown",
     };
 }
 
@@ -1025,6 +1059,7 @@ fn resultName(rc: i32) []const u8 {
         r4os.abi.service_api_result_disabled => "disabled",
         r4os.abi.service_api_result_spawn_failed => "spawn-failed",
         r4os.abi.service_api_result_stop_failed => "stop-failed",
+        r4os.abi.service_api_result_self_restart => "self-restart-refused",
         else => "invalid",
     };
 }
@@ -1036,10 +1071,10 @@ const Token = struct {
 
 fn takeToken(s_raw: []const u8) ?Token {
     const s = trim(s_raw);
-    if (s.len == 0) return null;
-    var end: usize = 0;
-    while (end < s.len and s[end] != ' ' and s[end] != '\t') : (end += 1) {}
-    return .{ .token = s[0..end], .rest = trim(s[end..]) };
+    var failure: r4os.arguments.Failure = .{};
+    var cursor = r4os.arguments.ArgCursor.init(s, .{ .quotes = @intFromEnum(r4os.arguments.Quotes.none) }, &failure) catch return null;
+    const item = (cursor.next() catch return null) orelse return null;
+    return .{ .token = item.bytes(s) catch return null, .rest = trim(cursor.remainingRaw() catch return null) };
 }
 
 fn trim(s: []const u8) []const u8 {
@@ -1048,12 +1083,6 @@ fn trim(s: []const u8) []const u8 {
     while (start < end and (s[start] == ' ' or s[start] == '\t' or s[start] == '\r' or s[start] == '\n')) : (start += 1) {}
     while (end > start and (s[end - 1] == ' ' or s[end - 1] == '\t' or s[end - 1] == '\r' or s[end - 1] == '\n')) : (end -= 1) {}
     return s[start..end];
-}
-
-fn zSlice(ptr: [*:0]const u8) []const u8 {
-    var len: usize = 0;
-    while (ptr[len] != 0) : (len += 1) {}
-    return ptr[0..len];
 }
 
 fn spanZ(buffer: []const u8) []const u8 {

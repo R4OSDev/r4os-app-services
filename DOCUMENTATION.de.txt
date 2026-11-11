@@ -31,3 +31,12 @@ Terminal-Schalter /CONSOLE den textuellen Aufruf kennzeichnen:
 Terminals. Unterstuetzte Steuerkommandos stehen in printUsage in src/main.zig.
 Deren Status stammt aus dem zentralen Servicebesitzer; SERVICES schreibt
 keine SERVICES.R4S. Die Konfiguration wird durch SERVMAN gespeichert.
+
+API-Migration 0.90.64
+---------------------
+SERVICES 0.1.11 verwendet Start2 und Query2 fuer System, Fenster und
+Zeichnung. Verwaltungsvorgaenge verwenden die gemeinsame Inventarsteuerung
+mit gebundener Registrierung und Prozessgeneration. Die GUI wartet
+waehrend eines laufenden SERVMAN-Speichervorgangs auf Fenstereingabe
+oder die exakte Kind-Completion. Sie zeigt den Speichererfolg nach Reap
+an. Der CLI-Aufruf wartet auf das Speicherergebnis.
