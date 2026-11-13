@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .r4os_sdk = .{
-            .url = "https://github.com/R4OSDev/r4os-sdk/archive/05d58898a978e5f3523f2ea24572a740e8b8cdbc.tar.gz",
-            .hash = "r4os_sdk-0.64.200-NnPzAp_ECwLrxkpRI6hy-FOe4FD6vaezCLtlhmKo29jW",
+            .url = "https://github.com/R4OSDev/r4os-sdk/archive/2de035e42ee40982f344a1e8d76f8dd925fd9057.tar.gz",
+            .hash = "r4os_sdk-0.64.214-NnPzAqR9HQLJ6a6_GvbBwnxDG6n_wHbGXX3ZggoPb4VX",
         },
     },
     .paths = .{
