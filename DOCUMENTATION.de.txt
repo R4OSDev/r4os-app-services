@@ -13,7 +13,7 @@ Projekt. module.R4MF ist die Quelle fuer Version, Ziel, Imports und App-Klasse.
 Der Workspace-Artefaktpfad ist Artifacts/Modules/Services/SERVICES.R4X.
 
 Der SDK-Einstieg ist r4_app_main. Die App-Klasse ist gui; die eingebauten
-Plattformgruppen R4SYS, R4DESK und R4DRAW werden ueber Query:1 importiert.
+Plattformgruppen R4SYS, R4DESK und R4DRAW werden ueber Query2:2 importiert.
 Ziel im Image: C:\R4OS\SOFTWARE\DESKTOP\SERVICES.R4X.
 
 Listen und Steuerung
